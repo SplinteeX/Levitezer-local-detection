@@ -21,9 +21,10 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from fastapi import Form
 
 import yaml
 import socket
@@ -63,6 +64,7 @@ DEVICE = os.environ.get("YOLO_DEVICE", None)
 DATA_YAML = APP_BASE / "data.yaml"
 DATA = load_data_yaml(DATA_YAML)
 NAMES = DATA.get("names") if DATA else None
+MODEL_NAMES = None
 
 
 class Detection(BaseModel):
@@ -91,6 +93,14 @@ def load_model_on_startup():
 
     print(f"Loading YOLO model from: {WEIGHTS}")
     MODEL = YOLO(WEIGHTS)
+    # capture model's internal names separately so we can map indices -> model label
+    try:
+        mdl = getattr(MODEL, "model", None)
+        if mdl is not None and hasattr(mdl, "names"):
+            global MODEL_NAMES
+            MODEL_NAMES = list(getattr(mdl, "names"))
+    except Exception:
+        MODEL_NAMES = None
     # refresh names if the model has .model.names or data.yaml provided
     if not NAMES:
         try:
@@ -129,9 +139,16 @@ def results_to_detections(res) -> List[Dict[str, Any]]:
 
     for (x1, y1, x2, y2), c, cls in zip(xyxy, confs, cls_inds):
         name = NAMES[cls] if NAMES and cls < len(NAMES) else None
+        model_name = None
+        try:
+            if MODEL_NAMES and cls < len(MODEL_NAMES):
+                model_name = MODEL_NAMES[cls]
+        except Exception:
+            model_name = None
         detections.append({
             "cls": int(cls),
             "name": name,
+            "model_name": model_name,
             "conf": float(c),
             "xyxy": [float(x1), float(y1), float(x2), float(y2)],
         })
@@ -139,31 +156,71 @@ def results_to_detections(res) -> List[Dict[str, Any]]:
     return detections
 
 
-@app.post("/detect", response_model=DetectResponse)
-async def detect(image: UploadFile = File(...), save_annotated: bool = True, return_image: bool = False):
-    """Accept an uploaded image (multipart/form-data) and run detection.
+@app.post("/detect")
+async def detect(request: Request):
+    """Unified handler for multipart, base64, or JSON inputs (no File() param)."""
+    import base64, json
+    from PIL import Image
+    import numpy as np
+    from io import BytesIO
 
-    Returns JSON with detections and annotated image path.
-    If return_image=True, returns base64 string in annotated_path (not a file path).
-    """
-    if image.content_type.split("/")[0] != "image":
-        raise HTTPException(status_code=400, detail="Uploaded file is not an image")
+    # Read body once (safe now that FastAPI didn't parse it)
+    content_type = (request.headers.get("content-type") or "").lower()
+    raw_body = await request.body()
+    data = None
+    is_roboflow_style = False
 
-    data = await image.read()
-    try:
-        from PIL import Image
-        import numpy as np
-    except Exception:
-        raise HTTPException(status_code=500, detail="Pillow and numpy are required on the server")
+    # ----- Multipart upload -----
+    if "multipart/form-data" in content_type:
+        form = await request.form()
+        upload = form.get("image")
+        if not upload:
+            raise HTTPException(status_code=400, detail="Missing 'image' file in multipart form")
+        data = await upload.read()
 
+    # ----- JSON -----
+    elif content_type.startswith("application/json"):
+        is_roboflow_style = True
+        try:
+            body = json.loads(raw_body.decode("utf8", errors="ignore"))
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
+        img_b64 = body.get("image") or body.get("image_base64")
+        image_url = body.get("image_url") or body.get("url")
+        if img_b64:
+            if img_b64.startswith("data:"):
+                img_b64 = img_b64.split(",", 1)[1]
+            data = base64.b64decode(img_b64)
+        elif image_url:
+            from urllib.request import urlopen
+            with urlopen(image_url) as resp:
+                data = resp.read()
+        else:
+            raise HTTPException(status_code=422, detail="JSON must include 'image' or 'image_url'")
+
+    # ----- Base64-only body -----
+    elif (
+        "form-urlencoded" in content_type
+        or content_type.startswith("text")
+        or content_type.startswith("application/x-www-form-urlencoded")
+        or content_type == ""
+    ):
+        is_roboflow_style = True
+        text = raw_body.decode("utf8", errors="replace").strip()
+        if text.startswith("data:"):
+            text = text.split(",", 1)[1]
+        data = base64.b64decode(text)
+
+    else:
+        raise HTTPException(status_code=422, detail="Unsupported content-type")
+
+    # ---------------- YOLO Inference ----------------
     try:
         img = Image.open(BytesIO(data)).convert("RGB")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to read image: {e}")
 
-    img_np = np.array(img)  # RGB
-
-    # run inference
+    img_np = np.array(img)
     try:
         try:
             results = MODEL(img_np, imgsz=IMGSZ, conf=CONF, device=DEVICE)
@@ -173,30 +230,65 @@ async def detect(image: UploadFile = File(...), save_annotated: bool = True, ret
         raise HTTPException(status_code=500, detail=f"Model inference failed: {e}")
 
     if not results:
+        if is_roboflow_style:
+            return {"predictions": [], "annotated": None}
         return {"detections": [], "annotated_path": None}
 
     res = results[0]
     detections = results_to_detections(res)
 
+    # Filter detections to dataset classes (use data.yaml names when available)
+    allowed_names = set(DATA.get("names", [])) if DATA else set()
+    if allowed_names:
+        filtered_detections = [
+            d for d in detections if (d.get("name") in allowed_names) or (d.get("model_name") in allowed_names)
+        ]
+    else:
+        filtered_detections = detections
+
+    # Annotate and save (draw only filtered detections)
     annotated_path = None
-    if save_annotated:
-        try:
-            annotated = res.plot()
-            import cv2
-            ts = int(time.time() * 1000)
-            filename = f"api_{ts}.jpg"
-            out_file = OUT_DIR / filename
-            cv2.imwrite(str(out_file), annotated[:, :, ::-1])
-            annotated_path = str(out_file.relative_to(APP_BASE))
-            if return_image:
-                # return base64-encoded image instead of path
-                import base64
+    try:
+        import cv2, time
 
-                with open(out_file, "rb") as f:
-                    b64 = base64.b64encode(f.read()).decode("ascii")
-                annotated_path = f"data:image/jpeg;base64,{b64}"
-        except Exception as e:
-            # fail gracefully but include detections
-            annotated_path = None
+        # start from original image (RGB) and draw boxes
+        annotated = np.array(img).copy()
+        for d in filtered_detections:
+            x1, y1, x2, y2 = [int(round(v)) for v in d.get("xyxy", [0, 0, 0, 0])]
+            label = d.get("name") or d.get("model_name") or str(d.get("cls"))
+            conf = d.get("conf", 0.0)
+            # draw rectangle (RGB), will convert to BGR for cv2.imwrite
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            txt = f"{label} {conf:.2f}"
+            # put text background
+            (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            cv2.rectangle(annotated, (x1, max(0, y1 - th - 6)), (x1 + tw + 6, y1), (0, 255, 0), -1)
+            cv2.putText(annotated, txt, (x1 + 3, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
 
-    return {"detections": detections, "annotated_path": annotated_path}
+        ts = int(time.time() * 1000)
+        filename = f"api_{ts}.jpg"
+        out_file = OUT_DIR / filename
+        cv2.imwrite(str(out_file), annotated[:, :, ::-1])
+        annotated_path = str(out_file.relative_to(APP_BASE))
+    except Exception:
+        annotated_path = None
+
+    # ----- Roboflow-style response -----
+    if is_roboflow_style:
+        width, height = img.size
+        predictions = []
+        for d in filtered_detections:
+            x1, y1, x2, y2 = d["xyxy"]
+            cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+            w, h = x2 - x1, y2 - y1
+            predictions.append({
+                "x": cx / width, "y": cy / height,
+                "width": w / width, "height": h / height,
+                "confidence": d["conf"],
+                "class": d.get("name") or str(d["cls"]),
+                "bbox": {"x_min": x1, "y_min": y1, "x_max": x2, "y_max": y2},
+            })
+        return {"predictions": predictions, "annotated": annotated_path}
+
+    # ----- Default response -----
+    return {"detections": filtered_detections, "annotated_path": annotated_path}
