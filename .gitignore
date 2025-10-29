@@ -11,6 +11,12 @@ ENV/
 env.bak/
 venv.bak/
 
+# Model data folders (Train, Validation, Test)
+train/
+runs/
+valid/
+test/
+
 # PyInstaller
 *.manifest
 *.spec

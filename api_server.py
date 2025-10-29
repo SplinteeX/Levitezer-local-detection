@@ -43,22 +43,24 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # configuration
 # Prefer an explicit env var, otherwise prefer a found local weight like yolo11m.pt, then yolov11.pt
-env_weights = os.environ.get("YOLO_WEIGHTS")
+# Weight selection (no environment variables). Prefer repo root best.pt, then
+# yolo11m.pt, then yolov11.pt. Fallback to yolov11.pt so Ultralytics can try hub names.
 default_yolo11m = APP_BASE / "yolo11m.pt"
 default_yolov11 = APP_BASE / "yolov11.pt"
-if env_weights:
-    WEIGHTS = env_weights
-elif default_yolo11.exists():
-    WEIGHTS = str(default_yolo11)
+root_best = APP_BASE / "best.pt"
+if root_best.exists():
+    WEIGHTS = str(root_best)
+elif default_yolo11m.exists():
+    WEIGHTS = str(default_yolo11m)
 elif default_yolov11.exists():
     WEIGHTS = str(default_yolov11)
 else:
     # fallback to the default path (may not exist) so the loader can try hub names
     WEIGHTS = str(default_yolov11)
 
-IMGSZ = int(os.environ.get("YOLO_IMGSZ", "640"))
-CONF = float(os.environ.get("YOLO_CONF", "0.25"))
-DEVICE = os.environ.get("YOLO_DEVICE", None)
+IMGSZ = 640
+CONF = 0.25
+DEVICE = None
 
 # load class names from data.yaml when available
 DATA_YAML = APP_BASE / "data.yaml"
